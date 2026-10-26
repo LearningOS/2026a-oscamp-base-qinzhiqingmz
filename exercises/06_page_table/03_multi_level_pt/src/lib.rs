@@ -103,7 +103,34 @@ impl Sv39PageTable {
     /// 提示：右移 (12 + level * 9) 位，然后与 0x1FF 做掩码。
     pub fn extract_vpn(va: u64, level: usize) -> usize {
         // TODO: 从虚拟地址中提取指定级别的 VPN 索引
-        todo!()
+        assert!(level < 3, "SV39 has exactly three page-table levels");
+        ((va >> (12 + level * 9)) & 0x1ff) as usize
+    }
+
+    fn canonical(va: u64) -> bool {
+        let high = va >> 39;
+        high == if va & (1 << 38) == 0 { 0 } else { u64::MAX >> 39 }
+    }
+
+    fn ensure_child(&mut self, table: u64, index: usize, level: usize) -> u64 {
+        let entry = self.nodes[&table].entries[index];
+        if entry & PTE_V != 0 && entry & (PTE_R | PTE_W | PTE_X) == 0 {
+            return (entry >> PPN_SHIFT) & ((1 << 44) - 1);
+        }
+        let child = self.alloc_node();
+        if entry & PTE_V != 0 {
+            // Split an existing large leaf rather than losing neighboring
+            // mappings when a smaller page inside that region is overwritten.
+            let base = (entry >> PPN_SHIFT) & ((1 << 44) - 1);
+            let flags = entry & 0xff;
+            let node = self.nodes.get_mut(&child).unwrap();
+            for (offset, pte) in node.entries.iter_mut().enumerate() {
+                let ppn = base + ((offset as u64) << ((level - 1) * 9));
+                *pte = (ppn << PPN_SHIFT) | flags;
+            }
+        }
+        self.nodes.get_mut(&table).unwrap().entries[index] = (child << PPN_SHIFT) | PTE_V;
+        child
     }
 
     /// 建立从虚拟页到物理页的映射（4KB 页）。
@@ -119,7 +146,14 @@ impl Sv39PageTable {
         // 对于中间层级（level 2 和 level 1），如果对应 VPN 的页表项（PTE）无效（PTE_V == 0），
         // 则需要分配一个新的页表节点（使用 alloc_node），并将新节点的 PPN 写入当前 PTE（仅设置 PTE_V 标志）。
         // 最后在 level 0 的 PTE 中写入目标物理页号（pa >> 12）和 flags。
-        todo!()
+        assert!(Self::canonical(va), "noncanonical SV39 virtual address");
+        assert!(pa < (1 << 56), "physical address exceeds 44-bit PPN");
+        let mut table = self.root_ppn;
+        for level in (1..=2).rev() {
+            table = self.ensure_child(table, Self::extract_vpn(va, level), level);
+        }
+        self.nodes.get_mut(&table).unwrap().entries[Self::extract_vpn(va, 0)] =
+            ((pa >> 12) << PPN_SHIFT) | (flags & 0xff);
     }
 
     /// 遍历三级页表，将虚拟地址翻译为物理地址。
@@ -141,7 +175,29 @@ impl Sv39PageTable {
         // 如果 PTE 是叶节点（即 R、W、X 标志位中有至少一个被置位），则可以直接使用该 PTE 中的物理页号（PPN）计算最终的物理地址。
         // 否则，该 PTE 指向下一级页表节点，继续遍历下一级。
         // 遍历到 level 0 时，PTE 必须是叶节点。
-        todo!()
+        if !Self::canonical(va) {
+            return TranslateResult::PageFault;
+        }
+        let mut table = self.root_ppn;
+        for level in (0..=2).rev() {
+            let Some(node) = self.nodes.get(&table) else { return TranslateResult::PageFault };
+            let entry = node.entries[Self::extract_vpn(va, level)];
+            if entry & PTE_V == 0 || (entry & PTE_W != 0 && entry & PTE_R == 0) {
+                return TranslateResult::PageFault;
+            }
+            let ppn = (entry >> PPN_SHIFT) & ((1 << 44) - 1);
+            if entry & (PTE_R | PTE_W | PTE_X) != 0 {
+                let offset_bits = 12 + level * 9;
+                let mask = (1u64 << offset_bits) - 1;
+                let base = ppn << 12;
+                if base & mask != 0 {
+                    return TranslateResult::PageFault;
+                }
+                return TranslateResult::Ok(base | (va & mask));
+            }
+            table = ppn;
+        }
+        TranslateResult::PageFault
     }
 
     /// 建立大页映射（2MB superpage，在 level 1 设叶子 PTE）。
@@ -160,7 +216,11 @@ impl Sv39PageTable {
         // 你需要在 level 2 找到或创建中间页表节点，然后在 level 1 写入叶子 PTE。
         // 注意大页的物理页号计算方式与普通页相同（pa >> 12），
         // 但翻译时 offset 包含虚拟地址的低 21 位（VPN[0] 部分 + 12 位页内偏移）。
-        todo!()
+        assert!(Self::canonical(va), "noncanonical SV39 virtual address");
+        assert!(pa < (1 << 56), "physical address exceeds 44-bit PPN");
+        let table = self.ensure_child(self.root_ppn, Self::extract_vpn(va, 2), 2);
+        self.nodes.get_mut(&table).unwrap().entries[Self::extract_vpn(va, 1)] =
+            ((pa >> 12) << PPN_SHIFT) | (flags & 0xff);
     }
 }
 
