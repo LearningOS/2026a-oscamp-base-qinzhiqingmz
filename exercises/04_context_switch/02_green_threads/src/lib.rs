@@ -158,21 +158,24 @@ impl Scheduler {
         // Host threads have separate runtime pointers, so public yield_now on
         // another OS thread cannot access this scheduler. Restore outer runtime
         // state as well, allowing a nested cooperative scheduler to finish.
-        let previous = SCHEDULER.with(|slot| slot.replace(self as *mut Self));
+        let pointer = self as *mut Self;
+        let previous = SCHEDULER.with(|slot| slot.replace(pointer));
         while self.threads[1..].iter().any(|thread| thread.state != ThreadState::Finished) {
-            self.schedule_next();
+            // SAFETY: pointer comes from this live scheduler. No temporary
+            // mutable receiver borrow is kept across the context transition.
+            unsafe { Self::schedule_next(pointer) };
         }
         SCHEDULER.with(|slot| slot.set(previous));
     }
 
     /// Find the next ready thread (starting from `current + 1` round-robin), mark current as `Ready` (if not `Finished`), mark next as `Running`, set `CURRENT_THREAD_ENTRY` if the next thread has an entry, then switch to it.
-    fn schedule_next(&mut self) {
+    fn prepare_switch(&mut self) -> Option<(*mut TaskContext, *const TaskContext)> {
         let current = self.current;
         let count = self.threads.len();
         let next = (1..=count)
             .map(|offset| (current + offset) % count)
             .find(|&index| self.threads[index].state == ThreadState::Ready);
-        let Some(next) = next else { return };
+        let next = next?;
         if self.threads[current].state != ThreadState::Finished {
             self.threads[current].state = ThreadState::Ready;
         }
@@ -183,9 +186,18 @@ impl Scheduler {
         }
         let old_context = self.threads[current].ctx.as_mut_ptr();
         let new_context = self.threads[next].ctx.as_ptr();
-        // SAFETY: Contexts are distinct, their stacks stay owned by threads,
-        // and no Rust context references are held across the stack switch.
-        unsafe { switch_context(old_context, new_context) };
+        Some((old_context, new_context))
+    }
+
+    unsafe fn schedule_next(scheduler: *mut Self) {
+        // End the protected mutable receiver borrow before another green task
+        // can re-enter the scheduler through its thread-local raw pointer.
+        let contexts = unsafe { (&mut *scheduler).prepare_switch() };
+        if let Some((old_context, new_context)) = contexts {
+            // SAFETY: Contexts are distinct, their stacks stay owned by threads,
+            // and no temporary Scheduler/TaskContext reference spans the switch.
+            unsafe { switch_context(old_context, new_context) };
+        }
     }
 }
 
@@ -204,7 +216,7 @@ pub fn yield_now() {
     let scheduler = SCHEDULER.with(|slot| slot.get());
     if !scheduler.is_null() {
         // SAFETY: This pointer is installed by run on the same host thread.
-        unsafe { (*scheduler).schedule_next() };
+        unsafe { Scheduler::schedule_next(scheduler) };
     }
 }
 
@@ -216,8 +228,9 @@ fn thread_finished() -> ! {
         unsafe {
             let sched = &mut *scheduler;
             sched.threads[sched.current].state = ThreadState::Finished;
-            sched.schedule_next();
         }
+        // The temporary sched borrow above has ended before reentrant execution.
+        unsafe { Scheduler::schedule_next(scheduler) };
     }
     // A finished thread must never resume or return into an uninitialized RA.
     std::process::abort();
