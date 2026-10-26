@@ -38,6 +38,15 @@
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::null_mut;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+struct ListGuard<'a>(&'a AtomicBool);
+
+impl Drop for ListGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 /// Free block header, stored at the beginning of each free memory block
 struct FreeBlock {
@@ -46,6 +55,7 @@ struct FreeBlock {
 }
 
 pub struct FreeListAllocator {
+    operation_lock: AtomicBool,
     heap_start: usize,
     heap_end: usize,
     /// Bump pointer: unallocated region starts here
@@ -71,6 +81,7 @@ impl FreeListAllocator {
     /// `heap_start..heap_end` must be a valid readable and writable memory region.
     pub unsafe fn new(heap_start: usize, heap_end: usize) -> Self {
         Self {
+            operation_lock: AtomicBool::new(false),
             heap_start,
             heap_end,
             bump_next: core::sync::atomic::AtomicUsize::new(heap_start),
@@ -79,6 +90,13 @@ impl FreeListAllocator {
             #[cfg(not(test))]
             free_list: core::cell::UnsafeCell::new(null_mut()),
         }
+    }
+
+    fn lock(&self) -> ListGuard<'_> {
+        while self.operation_lock.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            core::hint::spin_loop();
+        }
+        ListGuard(&self.operation_lock)
     }
 
     #[cfg(test)]
@@ -104,6 +122,9 @@ impl FreeListAllocator {
 
 unsafe impl GlobalAlloc for FreeListAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // Keep traversal, removal and publication in one critical section in
+        // both test and no_std builds; locking individual head accesses is not enough.
+        let _guard = self.lock();
         // Ensure block is at least large enough to hold a FreeBlock header (for future dealloc)
         let size = layout.size().max(core::mem::size_of::<FreeBlock>());
         let align = layout.align().max(core::mem::align_of::<FreeBlock>());
@@ -119,10 +140,40 @@ unsafe impl GlobalAlloc for FreeListAllocator {
         // TODO: Step 2 — no suitable block in free_list, allocate from bump region
         //
         // Same logic as 02_bump_allocator's alloc
-        todo!()
+        let mut previous: *mut FreeBlock = null_mut();
+        let mut current = self.free_list_head();
+        while !current.is_null() {
+            // SAFETY: The operation lock protects live free-list headers.
+            unsafe {
+                if current as usize % align == 0 && (*current).size >= size {
+                    if previous.is_null() {
+                        self.set_free_list_head((*current).next);
+                    } else {
+                        (*previous).next = (*current).next;
+                    }
+                    return current.cast();
+                }
+                previous = current;
+                current = (*current).next;
+            }
+        }
+        let next = self.bump_next.load(Ordering::SeqCst);
+        let Some(aligned) = next.checked_add(align - 1).map(|address| address & !(align - 1)) else {
+            return null_mut();
+        };
+        let Some(end) = aligned.checked_add(size) else {
+            return null_mut();
+        };
+        if end > self.heap_end {
+            return null_mut();
+        }
+        // All allocator operations are serialized by operation_lock.
+        self.bump_next.store(end, Ordering::SeqCst);
+        aligned as *mut u8
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let _guard = self.lock();
         let size = layout.size().max(core::mem::size_of::<FreeBlock>());
 
         // TODO: Insert the freed block at the head of free_list
@@ -131,7 +182,11 @@ unsafe impl GlobalAlloc for FreeListAllocator {
         // 1. Cast ptr to *mut FreeBlock
         // 2. Write FreeBlock { size, next: current list head }
         // 3. Update free_list head to ptr
-        todo!()
+        // SAFETY: alloc reserves header size/alignment even for small layouts;
+        // the caller returns a live allocation with its original layout once.
+        let block = ptr.cast::<FreeBlock>();
+        unsafe { block.write(FreeBlock { size, next: self.free_list_head() }) };
+        self.set_free_list_head(block);
     }
 }
 
