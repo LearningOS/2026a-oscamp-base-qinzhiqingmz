@@ -40,6 +40,7 @@ const WRITER_WAITING: u32 = 1 << 31;
 /// Writer-priority read-write lock. Implemented from scratch; does not use `std::sync::RwLock`.
 pub struct RwLock<T> {
     state: AtomicU32,
+    waiting_writers: AtomicU32,
     data: UnsafeCell<T>,
 }
 
@@ -50,6 +51,7 @@ impl<T> RwLock<T> {
     pub const fn new(data: T) -> Self {
         Self {
             state: AtomicU32::new(0),
+            waiting_writers: AtomicU32::new(0),
             data: UnsafeCell::new(data),
         }
     }
@@ -63,7 +65,19 @@ impl<T> RwLock<T> {
     /// 4. Try compare_exchange(s, s + 1, AcqRel, Acquire); on success return RwLockReadGuard { lock: self }.
     pub fn read(&self) -> RwLockReadGuard<'_, T> {
         // TODO
-        todo!()
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            if state & (WRITER_HOLDING | WRITER_WAITING) != 0
+                || state & READER_MASK == READER_MASK
+                || self.waiting_writers.load(Ordering::SeqCst) != 0
+            {
+                core::hint::spin_loop();
+                continue;
+            }
+            if self.state.compare_exchange_weak(state, state + 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                return RwLockReadGuard { lock: self };
+            }
+        }
     }
 
     /// Acquire the write lock. Blocks until no readers and no other writer.
@@ -75,7 +89,21 @@ impl<T> RwLock<T> {
     /// 4. On success return RwLockWriteGuard { lock: self }.
     pub fn write(&self) -> RwLockWriteGuard<'_, T> {
         // TODO
-        todo!()
+        self.waiting_writers.fetch_add(1, Ordering::SeqCst);
+        self.state.fetch_or(WRITER_WAITING, Ordering::AcqRel);
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            if state & (READER_MASK | WRITER_HOLDING) != 0 {
+                core::hint::spin_loop();
+                continue;
+            }
+            if self.state.compare_exchange_weak(state, WRITER_HOLDING | WRITER_WAITING,
+                Ordering::AcqRel, Ordering::Acquire).is_ok()
+            {
+                self.waiting_writers.fetch_sub(1, Ordering::SeqCst);
+                return RwLockWriteGuard { lock: self };
+            }
+        }
     }
 }
 
@@ -90,7 +118,8 @@ impl<T> Deref for RwLockReadGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        todo!()
+        // SAFETY: Readers exclude writers and expose only shared references.
+        unsafe { &*self.lock.data.get() }
     }
 }
 
@@ -98,7 +127,7 @@ impl<T> Deref for RwLockReadGuard<'_, T> {
 // Decrement reader count: self.lock.state.fetch_sub(1, Ordering::Release)
 impl<T> Drop for RwLockReadGuard<'_, T> {
     fn drop(&mut self) {
-        todo!()
+        self.lock.state.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -113,7 +142,8 @@ impl<T> Deref for RwLockWriteGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        todo!()
+        // SAFETY: This writer guard excludes all other readers/writers.
+        unsafe { &*self.lock.data.get() }
     }
 }
 
@@ -121,7 +151,8 @@ impl<T> Deref for RwLockWriteGuard<'_, T> {
 // Return mutable reference: unsafe { &mut *self.lock.data.get() }
 impl<T> DerefMut for RwLockWriteGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        todo!()
+        // SAFETY: Exclusive writer ownership and an exclusive guard borrow.
+        unsafe { &mut *self.lock.data.get() }
     }
 }
 
@@ -129,7 +160,8 @@ impl<T> DerefMut for RwLockWriteGuard<'_, T> {
 // Clear writer bits so lock is free: self.lock.state.fetch_and(!(WRITER_HOLDING | WRITER_WAITING), Ordering::Release)
 impl<T> Drop for RwLockWriteGuard<'_, T> {
     fn drop(&mut self) {
-        todo!()
+        let waiting = self.lock.waiting_writers.load(Ordering::SeqCst) != 0;
+        self.lock.state.store(if waiting { WRITER_WAITING } else { 0 }, Ordering::Release);
     }
 }
 

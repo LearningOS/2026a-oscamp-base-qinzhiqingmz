@@ -39,9 +39,17 @@ impl<T> SpinLock<T> {
     ///
     /// # Safety
     /// Caller must ensure `unlock` is called after using the data.
+    /// This educational manual interface also requires that the reference is
+    /// never used after unlock and only the owner calls unlock. Prefer the
+    /// next exercise's RAII guard for an interface enforcing these lifetimes.
     pub fn lock(&self) -> &mut T {
         // TODO
-        todo!()
+        while self.locked.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            core::hint::spin_loop();
+        }
+        // SAFETY: The acquired bit provides exclusive access under the manual
+        // API's documented caller discipline until unlock is called.
+        unsafe { &mut *self.data.get() }
     }
 
     /// Release lock.
@@ -49,14 +57,19 @@ impl<T> SpinLock<T> {
     /// TODO: Set locked to false (using Release ordering)
     pub fn unlock(&self) {
         // TODO
-        todo!()
+        self.locked.store(false, Ordering::Release);
     }
 
     /// Try to acquire lock without spinning.
     /// Returns Some(&mut T) on success, None if lock is busy.
     pub fn try_lock(&self) -> Option<&mut T> {
         // TODO: Single compare_exchange attempt
-        todo!()
+        self.locked.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| {
+                // SAFETY: Successful acquisition excludes other lock owners.
+                unsafe { &mut *self.data.get() }
+            })
     }
 }
 
